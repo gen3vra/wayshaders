@@ -582,7 +582,7 @@ int main(int argc, char *argv[]) {
       logDebug("Found %s", vert_filename.c_str());
     }
 
-    ShaderLayer layer;
+    ShaderLayer layer {};
     layer.enabled = true;
     layer.num = shader_num;
     layer.prog = create_program(shader_code.c_str(), vert_code.c_str());
