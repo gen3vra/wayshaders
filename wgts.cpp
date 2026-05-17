@@ -596,7 +596,7 @@ int main(int argc, char *argv[]) {
     layer.current_buffer = 0;
 
     // Multipass enabling
-    for (int i = 0; i < shader_num; ++i) {
+    for (int i = 0; i <= shader_num; ++i) {
       std::string channel_name = "u_sampler" + std::to_string(i);
       GLint channel_uniform =
           glGetUniformLocation(layer.prog, channel_name.c_str());
