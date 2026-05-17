@@ -1,6 +1,6 @@
 # wayshaders
 ## Display GLSL shaders on a transparent window in Wayland
-Works well with Hyprwinwrap.
+Works well with [Hyprwinwrap](https://github.com/gen3vra/hyprwinwrap).
 
 ## Building
 `apt install libwayland-dev libwayland-egl1 libwayland-egl++1 libegl1-mesa-dev libgl-dev wayland-protocols` (Debian example)
