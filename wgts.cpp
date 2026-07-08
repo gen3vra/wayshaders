@@ -181,13 +181,14 @@ struct client_state {
   int frame_count = 0;
 
   std::vector<ShaderLayer> layers;
-  GLuint quad_vao, quad_vbo;
+  GLuint quad_vbo;
 };
 
 static void init_multipass(client_state *st) {
   for (ShaderLayer &shader : st->layers) {
     logDebug("Process shader%d multipass", shader.num);
     glUseProgram(shader.prog);
+    glUniform2f(shader.u_resolution, st->width, st->height);
     if (shader.multipass) {
       glGenFramebuffers(2, shader.fbo);
       glGenTextures(2, shader.texture);
@@ -237,6 +238,8 @@ static void init_multipass(client_state *st) {
 static void resize_multipass(client_state *st) {
   logDebug("Resized window!");
   for (ShaderLayer &shader : st->layers) {
+    glUseProgram(shader.prog);
+    glUniform2f(shader.u_resolution, st->width, st->height);
     if (shader.multipass) {
       glDeleteTextures(2, shader.texture);
       // My textures yay
@@ -320,7 +323,8 @@ static void toplevel_configure(void *data, xdg_toplevel *, int32_t width,
                                int32_t height, wl_array *) {
   client_state *st = (client_state *)data;
 
-  if (width > 0 && height > 0) {
+  if (width > 0 && height > 0 &&
+      (width != st->width || height != st->height)) {
     st->width = width;
     st->height = height;
     // logDebug("Window resize");
@@ -404,31 +408,25 @@ static GLuint create_program(const char *frag_shader, const char *vert_shader) {
   return prog;
 }
 
+static void init_quad(client_state *st) {
+  const float quad_verts[] = {
+      -1.f, -1.f, 0.f, 0.f, 1.f, -1.f, 1.f, 0.f,
+      -1.f, 1.f,  0.f, 1.f, 1.f, 1.f,  1.f, 1.f,
+  };
+  glGenBuffers(1, &st->quad_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, st->quad_vbo);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts,
+               GL_STATIC_DRAW);
+  glVertexPointer(2, GL_FLOAT, 4 * sizeof(float), (void *)0);
+  glTexCoordPointer(2, GL_FLOAT, 4 * sizeof(float),
+                    (void *)(2 * sizeof(float)));
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+}
+
 static void draw(client_state *st) {
   static double start = get_time_seconds();
   float t = (float)(get_time_seconds() - start);
-
-  auto draw_fullscreen_quad = [](int with_texcoords) {
-    glBegin(GL_TRIANGLE_STRIP);
-
-    if (with_texcoords) {
-      glTexCoord2f(0.f, 0.f);
-      glVertex2f(-1.f, -1.f);
-      glTexCoord2f(1.f, 0.f);
-      glVertex2f(1.f, -1.f);
-      glTexCoord2f(0.f, 1.f);
-      glVertex2f(-1.f, 1.f);
-      glTexCoord2f(1.f, 1.f);
-      glVertex2f(1.f, 1.f);
-    } else {
-      glVertex2f(-1.f, -1.f);
-      glVertex2f(1.f, -1.f);
-      glVertex2f(-1.f, 1.f);
-      glVertex2f(1.f, 1.f);
-    }
-
-    glEnd();
-  };
 
   // Multipass
   for (ShaderLayer &shader : st->layers) {
@@ -440,8 +438,6 @@ static void draw(client_state *st) {
 
       glBindFramebuffer(GL_FRAMEBUFFER, shader.fbo[write_buffer]);
       glViewport(0, 0, st->width, st->height);
-      glClearColor(0.f, 0.f, 0.f, 0.f);
-      glClear(GL_COLOR_BUFFER_BIT);
 
       for (int i = 0; i <= shader.num; ++i) {
         glActiveTexture(GL_TEXTURE0 + i);
@@ -450,11 +446,10 @@ static void draw(client_state *st) {
         glBindTexture(GL_TEXTURE_2D, st->layers[i].texture[buffer]);
       }
 
-      glUniform2f(shader.u_resolution, st->width, st->height);
       glUniform1f(shader.u_time, t);
       glUniform1f(shader.u_frame, st->frame_count);
 
-      draw_fullscreen_quad(0);
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
       shader.current_buffer = write_buffer;
     }
@@ -468,21 +463,22 @@ static void draw(client_state *st) {
 
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glActiveTexture(GL_TEXTURE0);
   glEnable(GL_TEXTURE_2D);
 
   for (ShaderLayer &shader : st->layers) {
     if (shader.enabled) {
-      glUseProgram(shader.prog);
       if (shader.multipass) {
+        glUseProgram(0);
         glBindTexture(GL_TEXTURE_2D, shader.texture[shader.current_buffer]);
 
-        draw_fullscreen_quad(1);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
       } else {
-        glUniform2f(shader.u_resolution, st->width, st->height);
+        glUseProgram(shader.prog);
         glUniform1f(shader.u_time, t);
         glUniform1f(shader.u_frame, st->frame_count);
 
-        draw_fullscreen_quad(0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
       }
     }
   }
@@ -490,9 +486,11 @@ static void draw(client_state *st) {
   glDisable(GL_TEXTURE_2D);
   glDisable(GL_BLEND);
 
-  GLenum err;
-  while ((err = glGetError()) != GL_NO_ERROR) {
-    logDebug("OpenGL error: 0x%x", err);
+  if (debug) {
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+      logDebug("OpenGL error: 0x%x", err);
+    }
   }
 
   eglSwapBuffers(st->egl_display, st->egl_surface);
@@ -553,6 +551,7 @@ int main(int argc, char *argv[]) {
   wl_surface_commit(st.surface);
 
   init_egl(&st);
+  init_quad(&st);
 
   int shader_num = 0;
   while (true) {
