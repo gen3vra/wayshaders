@@ -331,6 +331,7 @@ static void toplevel_configure(void *data, xdg_toplevel *, int32_t width,
     resize_multipass(st);
 
     wl_egl_window_resize(st->egl_window, width, height, 0, 0);
+    glViewport(0, 0, width, height);
   }
 }
 
@@ -375,6 +376,8 @@ static void init_egl(client_state *st) {
 
   eglMakeCurrent(st->egl_display, st->egl_surface, st->egl_surface,
                  st->egl_context);
+
+  eglSwapInterval(st->egl_display, 0);
 }
 
 static GLuint compile_shader(GLenum type, const char *src) {
@@ -422,6 +425,11 @@ static void init_quad(client_state *st) {
                     (void *)(2 * sizeof(float)));
   glEnableClientState(GL_VERTEX_ARRAY);
   glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+
+  glClearColor(0.f, 0.f, 0.f, 0.f);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glEnable(GL_TEXTURE_2D);
+  glViewport(0, 0, st->width, st->height);
 }
 
 static void draw(client_state *st) {
@@ -437,9 +445,8 @@ static void draw(client_state *st) {
       glUseProgram(shader.prog);
 
       glBindFramebuffer(GL_FRAMEBUFFER, shader.fbo[write_buffer]);
-      glViewport(0, 0, st->width, st->height);
 
-      for (int i = 0; i <= shader.num; ++i) {
+      for (int i : shader.enabled_channels) {
         glActiveTexture(GL_TEXTURE0 + i);
         int buffer =
             (i == shader.num) ? read_buffer : st->layers[i].current_buffer;
@@ -457,14 +464,10 @@ static void draw(client_state *st) {
 
   // Composite
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  glViewport(0, 0, st->width, st->height);
-  glClearColor(0.f, 0.f, 0.f, 0.f);
   glClear(GL_COLOR_BUFFER_BIT);
 
   glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glActiveTexture(GL_TEXTURE0);
-  glEnable(GL_TEXTURE_2D);
 
   for (ShaderLayer &shader : st->layers) {
     if (shader.enabled) {
@@ -483,7 +486,6 @@ static void draw(client_state *st) {
     }
   }
 
-  glDisable(GL_TEXTURE_2D);
   glDisable(GL_BLEND);
 
   if (debug) {
@@ -495,6 +497,22 @@ static void draw(client_state *st) {
 
   eglSwapBuffers(st->egl_display, st->egl_surface);
   st->frame_count++;
+}
+
+static void frame_done(void *data, wl_callback *cb, uint32_t);
+
+static const wl_callback_listener frame_listener = {frame_done};
+
+static void request_frame(client_state *st) {
+  wl_callback *cb = wl_surface_frame(st->surface);
+  wl_callback_add_listener(cb, &frame_listener, st);
+}
+
+static void frame_done(void *data, wl_callback *cb, uint32_t) {
+  client_state *st = (client_state *)data;
+  wl_callback_destroy(cb);
+  request_frame(st);
+  draw(st);
 }
 
 int main(int argc, char *argv[]) {
@@ -638,9 +656,10 @@ int main(int argc, char *argv[]) {
 
   init_multipass(&st);
 
-  while (st.running) {
-    wl_display_dispatch_pending(st.display);
-    draw(&st);
+  request_frame(&st);
+  draw(&st);
+
+  while (st.running && wl_display_dispatch(st.display) != -1) {
   }
 
   eglDestroySurface(st.egl_display, st.egl_surface);
