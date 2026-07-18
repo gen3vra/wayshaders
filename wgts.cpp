@@ -4,6 +4,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <csignal>
+#include <pthread.h>
+
 #include <wayland-client.h>
 #include <wayland-egl.h>
 
@@ -140,23 +143,38 @@ void logDebug(const char *format, ...) {
   vprintf(format, args);
   va_end(args);
   printf("\n");
+  fflush(stdout);
+}
+
+static constexpr int palette_count = 18;
+
+static const char *palette_uniform_name(int i, char (&buf)[12]) {
+  if (i == 16)
+    return "u_background";
+  if (i == 17)
+    return "u_foreground";
+  snprintf(buf, sizeof(buf), "u_color%d", i);
+  return buf;
 }
 
 struct ShaderLayer {
+  // draw()-hot fields first so each layer stays within one cache line
   GLuint prog;
-  int num; // layer num, 0 = base
-  GLint u_resolution;
   GLint u_time;
   GLint u_frame;
   GLuint fbo[2];
   GLuint texture[2];
   int current_buffer;
+  int num; // layer num, 0 = base
   bool multipass;
   bool enabled;
   std::vector<int> enabled_channels;
 
+  GLint u_resolution;
   int setting_wrap_t;
   int setting_wrap_s;
+  GLint u_palette[palette_count];
+  bool uses_palette;
 };
 struct client_state {
   Settings settings;
@@ -182,7 +200,110 @@ struct client_state {
 
   std::vector<ShaderLayer> layers;
   GLuint quad_vbo;
+
+  std::string palette_path;
+  float palette[palette_count][3];
+  EGLContext palette_reload_context;
 };
+
+static bool parse_hex_color(const char *s, float out[3]) {
+  while (*s == ' ' || *s == '\t')
+    s++;
+  if (*s++ != '#')
+    return false;
+  int nibbles[6];
+  for (int i = 0; i < 6; i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9')
+      nibbles[i] = c - '0';
+    else if (c >= 'a' && c <= 'f')
+      nibbles[i] = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F')
+      nibbles[i] = c - 'A' + 10;
+    else
+      return false;
+  }
+  out[0] = (nibbles[0] << 4 | nibbles[1]) * (1.f / 255.f);
+  out[1] = (nibbles[2] << 4 | nibbles[3]) * (1.f / 255.f);
+  out[2] = (nibbles[4] << 4 | nibbles[5]) * (1.f / 255.f);
+  return true;
+}
+
+static bool load_palette(client_state *st) {
+  FILE *f = fopen(st->palette_path.c_str(), "rb");
+  if (!f)
+    return false;
+  char buf[4096];
+  size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[len] = '\0';
+
+  float staged[palette_count][3];
+  int loaded = 0;
+  char *line = buf;
+  while (loaded < palette_count && line) {
+    char *newline = strchr(line, '\n');
+    if (newline)
+      *newline = '\0';
+    if (parse_hex_color(line, staged[loaded]))
+      loaded++;
+    line = newline ? newline + 1 : nullptr;
+  }
+  if (loaded != palette_count)
+    return false;
+  memcpy(st->palette, staged, sizeof(staged));
+  return true;
+}
+
+static void apply_palette(client_state *st) {
+  for (ShaderLayer &shader : st->layers) {
+    if (!shader.uses_palette)
+      continue;
+    for (int i = 0; i < palette_count; i++) {
+      if (shader.u_palette[i] != -1)
+        glProgramUniform3fv(shader.prog, shader.u_palette[i], 1,
+                            st->palette[i]);
+    }
+  }
+}
+
+static void *palette_reload_thread(void *arg) {
+  client_state *st = (client_state *)arg;
+  eglBindAPI(EGL_OPENGL_API);
+  if (!eglMakeCurrent(st->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                      st->palette_reload_context)) {
+    logDebug("Palette reload unavailable: surfaceless make-current failed");
+    return nullptr;
+  }
+  sigset_t hup;
+  sigemptyset(&hup);
+  sigaddset(&hup, SIGHUP);
+  int sig;
+  while (sigwait(&hup, &sig) == 0) {
+    if (!load_palette(st))
+      continue;
+    apply_palette(st);
+    glFlush();
+    logDebug("Palette reloaded from %s", st->palette_path.c_str());
+  }
+  return nullptr;
+}
+
+static void start_palette_reload_thread(client_state *st) {
+  sigset_t hup;
+  sigemptyset(&hup);
+  sigaddset(&hup, SIGHUP);
+  pthread_sigmask(SIG_BLOCK, &hup, nullptr);
+  st->palette_reload_context = eglCreateContext(
+      st->egl_display, st->egl_config, st->egl_context, nullptr);
+  if (st->palette_reload_context == EGL_NO_CONTEXT) {
+    logDebug("Palette reload unavailable: shared EGL context failed");
+    return;
+  }
+  pthread_t thread;
+  pthread_create(&thread, nullptr, palette_reload_thread, st);
+  pthread_detach(thread);
+}
 
 static void init_multipass(client_state *st) {
   for (ShaderLayer &shader : st->layers) {
@@ -279,11 +400,9 @@ std::string load_shader_from_file(const std::string &filepath) {
 }
 
 double get_time_seconds() {
-  using clock = std::chrono::high_resolution_clock;
-  static auto start_time = clock::now();
-  auto now = clock::now();
-  std::chrono::duration<double> elapsed = now - start_time;
-  return elapsed.count();
+  using clock = std::chrono::steady_clock;
+  static const auto start_time = clock::now();
+  return std::chrono::duration<double>(clock::now() - start_time).count();
 }
 
 static void registry_global(void *data, wl_registry *registry, uint32_t name,
@@ -433,33 +552,37 @@ static void init_quad(client_state *st) {
 }
 
 static void draw(client_state *st) {
-  static double start = get_time_seconds();
-  float t = (float)(get_time_seconds() - start);
+  static const double start = get_time_seconds();
+  const float t = (float)(get_time_seconds() - start);
+  const float frame = (float)st->frame_count;
 
   // Multipass
   for (ShaderLayer &shader : st->layers) {
-    if (shader.enabled && shader.multipass) {
-      int read_buffer = shader.current_buffer;
-      int write_buffer = 1 - shader.current_buffer;
+    if (!shader.enabled || !shader.multipass)
+      continue;
 
-      glUseProgram(shader.prog);
+    const int read_buffer = shader.current_buffer;
+    const int write_buffer = 1 - read_buffer;
 
-      glBindFramebuffer(GL_FRAMEBUFFER, shader.fbo[write_buffer]);
+    glUseProgram(shader.prog);
 
-      for (int i : shader.enabled_channels) {
-        glActiveTexture(GL_TEXTURE0 + i);
-        int buffer =
-            (i == shader.num) ? read_buffer : st->layers[i].current_buffer;
-        glBindTexture(GL_TEXTURE_2D, st->layers[i].texture[buffer]);
-      }
+    glBindFramebuffer(GL_FRAMEBUFFER, shader.fbo[write_buffer]);
 
-      glUniform1f(shader.u_time, t);
-      glUniform1f(shader.u_frame, st->frame_count);
-
-      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-      shader.current_buffer = write_buffer;
+    for (const int i : shader.enabled_channels) {
+      glActiveTexture(GL_TEXTURE0 + i);
+      const int buffer =
+          (i == shader.num) ? read_buffer : st->layers[i].current_buffer;
+      glBindTexture(GL_TEXTURE_2D, st->layers[i].texture[buffer]);
     }
+
+    if (shader.u_time != -1)
+      glUniform1f(shader.u_time, t);
+    if (shader.u_frame != -1)
+      glUniform1f(shader.u_frame, frame);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    shader.current_buffer = write_buffer;
   }
 
   // Composite
@@ -469,20 +592,23 @@ static void draw(client_state *st) {
   glEnable(GL_BLEND);
   glActiveTexture(GL_TEXTURE0);
 
-  for (ShaderLayer &shader : st->layers) {
-    if (shader.enabled) {
-      if (shader.multipass) {
-        glUseProgram(0);
-        glBindTexture(GL_TEXTURE_2D, shader.texture[shader.current_buffer]);
+  for (const ShaderLayer &shader : st->layers) {
+    if (!shader.enabled)
+      continue;
 
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-      } else {
-        glUseProgram(shader.prog);
+    if (shader.multipass) {
+      glUseProgram(0);
+      glBindTexture(GL_TEXTURE_2D, shader.texture[shader.current_buffer]);
+
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    } else {
+      glUseProgram(shader.prog);
+      if (shader.u_time != -1)
         glUniform1f(shader.u_time, t);
-        glUniform1f(shader.u_frame, st->frame_count);
+      if (shader.u_frame != -1)
+        glUniform1f(shader.u_frame, frame);
 
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-      }
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
   }
 
@@ -546,6 +672,11 @@ int main(int argc, char *argv[]) {
   st.width = 700;
   st.height = 400;
   st.running = true;
+  st.palette_path = get_config_file("colors");
+  for (int i = 0; i < palette_count; i++) {
+    float def = (i == 16) ? 0.f : 0.85f;
+    st.palette[i][0] = st.palette[i][1] = st.palette[i][2] = def;
+  }
 
   st.display = wl_display_connect(nullptr);
   st.registry = wl_display_get_registry(st.display);
@@ -606,6 +737,13 @@ int main(int argc, char *argv[]) {
     layer.u_resolution = glGetUniformLocation(layer.prog, "u_resolution");
     layer.u_time = glGetUniformLocation(layer.prog, "u_time");
     layer.u_frame = glGetUniformLocation(layer.prog, "u_frame");
+    layer.uses_palette = false;
+    char uniform_name[12];
+    for (int i = 0; i < palette_count; i++) {
+      layer.u_palette[i] = glGetUniformLocation(
+          layer.prog, palette_uniform_name(i, uniform_name));
+      layer.uses_palette |= layer.u_palette[i] != -1;
+    }
     layer.fbo[0] = 0;
     layer.fbo[1] = 0;
     layer.texture[0] = 0;
@@ -655,6 +793,9 @@ int main(int argc, char *argv[]) {
   }
 
   init_multipass(&st);
+  load_palette(&st);
+  apply_palette(&st);
+  start_palette_reload_thread(&st);
 
   request_frame(&st);
   draw(&st);

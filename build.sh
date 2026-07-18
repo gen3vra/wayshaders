@@ -6,5 +6,5 @@ wayland-scanner private-code \
   /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
   xdg-shell.c
 
-gcc -O2 -c xdg-shell.c -o xdg-shell.o
-g++ -O2 wgts.cpp xdg-shell.o -o wayshaders -lwayland-client -lwayland-egl -lEGL -lGL
+gcc -O3 -flto -march=native -fno-plt -c xdg-shell.c -o xdg-shell.o
+g++ -O3 -flto -march=native -fno-plt -pthread wgts.cpp xdg-shell.o -o wayshaders -lwayland-client -lwayland-egl -lEGL -lGL
