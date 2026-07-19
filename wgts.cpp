@@ -23,6 +23,9 @@
 
 #include "xdg-shell.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "lib/stb_image.h"
+
 static const char *default_vert = R"(
 #version 120
 void main() {
@@ -147,6 +150,7 @@ void logDebug(const char *format, ...) {
 }
 
 static constexpr int palette_count = 18;
+static constexpr int max_image_channels = 4;
 
 static const char *palette_uniform_name(int i, char (&buf)[12]) {
   if (i == 16)
@@ -168,6 +172,10 @@ struct ShaderLayer {
   int num; // layer num, 0 = base
   bool multipass;
   bool enabled;
+  bool display; // shaderN.frag composites to screen; bufferN.frag stays offscreen
+  int image_count;
+  GLuint image_tex[max_image_channels];
+  int image_unit[max_image_channels];
   std::vector<int> enabled_channels;
 
   GLint u_resolution;
@@ -175,6 +183,9 @@ struct ShaderLayer {
   int setting_wrap_s;
   GLint u_palette[palette_count];
   bool uses_palette;
+
+  GLint u_texture[max_image_channels];
+  bool hdr; // offscreen buffers get float FBOs so they can hold values outside [0,1]
 };
 struct client_state {
   Settings settings;
@@ -305,7 +316,45 @@ static void start_palette_reload_thread(client_state *st) {
   pthread_detach(thread);
 }
 
+static GLuint load_image_texture(const std::string &path) {
+  stbi_set_flip_vertically_on_load(1); // Shadertoy samples textures vflipped
+  int w, h, n;
+  unsigned char *data = stbi_load(path.c_str(), &w, &h, &n, 4);
+  if (!data)
+    return 0;
+  GLuint tex;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+               data);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glGenerateMipmap(GL_TEXTURE_2D);
+  stbi_image_free(data);
+  logDebug("Loaded image %s (%dx%d)", path.c_str(), w, h);
+  return tex;
+}
+
+static GLuint load_layer_image(int layer, int channel) {
+  static const char *const exts[] = {"png", "jpg", "jpeg", "bmp", "tga"};
+  char stem[24];
+  const int stem_len = snprintf(stem, sizeof(stem), "img%d_%d.", layer, channel);
+  std::string name(stem, stem_len);
+  name.reserve(stem_len + 4);
+  for (const char *const e : exts) {
+    name.resize(stem_len);
+    name += e;
+    GLuint t = load_image_texture(get_config_file(name));
+    if (t)
+      return t;
+  }
+  return 0;
+}
+
 static void init_multipass(client_state *st) {
+  const int image_unit_base = (int)st->layers.size();
   for (ShaderLayer &shader : st->layers) {
     logDebug("Process shader%d multipass", shader.num);
     glUseProgram(shader.prog);
@@ -314,11 +363,13 @@ static void init_multipass(client_state *st) {
       glGenFramebuffers(2, shader.fbo);
       glGenTextures(2, shader.texture);
 
+      const GLint internal = shader.hdr ? GL_RGBA16F : GL_RGBA;
+      const GLenum type = shader.hdr ? GL_FLOAT : GL_UNSIGNED_BYTE;
       for (int i = 0; i < 2; i++) {
         // Texture
         glBindTexture(GL_TEXTURE_2D, shader.texture[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, st->width, st->height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, internal, st->width, st->height, 0,
+                     GL_RGBA, type, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -339,19 +390,25 @@ static void init_multipass(client_state *st) {
 
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       shader.current_buffer = 0;
+    }
 
-      // Check all possible channel vars
-      for (std::size_t i = 0; i < st->layers.size(); i++) {
-        logDebug("%d loop", i);
-        std::string name = "u_sampler" + std::to_string(i);
-        GLint channel = glGetUniformLocation(shader.prog, name.c_str());
-        if (channel != -1) {
-          glUniform1i(channel, i);
-          logDebug("Found %s in Shader %d", name.c_str(), shader.num);
-          // track enabled channel
-          shader.enabled_channels.push_back(i);
-        }
+    // Buffer inputs are resolved for every layer so a plain display pass can read an earlier buffer explicitly
+    for (std::size_t i = 0; i < st->layers.size(); i++) {
+      std::string name = "u_sampler" + std::to_string(i);
+      GLint channel = glGetUniformLocation(shader.prog, name.c_str());
+      if (channel != -1) {
+        glUniform1i(channel, i);
+        logDebug("Found %s in Shader %d", name.c_str(), shader.num);
+        shader.enabled_channels.push_back(i);
       }
+    }
+
+    // Image channels live past the buffer units
+    for (int k = 0; k < shader.image_count; k++)
+      shader.image_unit[k] += image_unit_base;
+    for (int c = 0; c < max_image_channels; c++) {
+      if (shader.u_texture[c] != -1)
+        glUniform1i(shader.u_texture[c], image_unit_base + c);
     }
   }
 }
@@ -366,10 +423,12 @@ static void resize_multipass(client_state *st) {
       // My textures yay
       glGenTextures(2, shader.texture);
 
+      const GLint internal = shader.hdr ? GL_RGBA16F : GL_RGBA;
+      const GLenum type = shader.hdr ? GL_FLOAT : GL_UNSIGNED_BYTE;
       for (int i = 0; i < 2; i++) {
         glBindTexture(GL_TEXTURE_2D, shader.texture[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, st->width, st->height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, internal, st->width, st->height, 0,
+                     GL_RGBA, type, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -575,6 +634,11 @@ static void draw(client_state *st) {
       glBindTexture(GL_TEXTURE_2D, st->layers[i].texture[buffer]);
     }
 
+    for (int k = 0; k < shader.image_count; k++) {
+      glActiveTexture(GL_TEXTURE0 + shader.image_unit[k]);
+      glBindTexture(GL_TEXTURE_2D, shader.image_tex[k]);
+    }
+
     if (shader.u_time != -1)
       glUniform1f(shader.u_time, t);
     if (shader.u_frame != -1)
@@ -590,19 +654,30 @@ static void draw(client_state *st) {
   glClear(GL_COLOR_BUFFER_BIT);
 
   glEnable(GL_BLEND);
-  glActiveTexture(GL_TEXTURE0);
 
   for (const ShaderLayer &shader : st->layers) {
-    if (!shader.enabled)
+    if (!shader.enabled || !shader.display)
       continue;
 
     if (shader.multipass) {
       glUseProgram(0);
+      glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, shader.texture[shader.current_buffer]);
 
       glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     } else {
       glUseProgram(shader.prog);
+
+      for (const int i : shader.enabled_channels) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D,
+                      st->layers[i].texture[st->layers[i].current_buffer]);
+      }
+      for (int k = 0; k < shader.image_count; k++) {
+        glActiveTexture(GL_TEXTURE0 + shader.image_unit[k]);
+        glBindTexture(GL_TEXTURE_2D, shader.image_tex[k]);
+      }
+
       if (shader.u_time != -1)
         glUniform1f(shader.u_time, t);
       if (shader.u_frame != -1)
@@ -651,6 +726,11 @@ int main(int argc, char *argv[]) {
              "$HOME/.config/wayshaders.\n"
              "You may provide shader[n].vert or a default will be used. "
              "Settings generated as 'wayshaders' in same directory.\n"
+             "'buffer[n].frag' is an offscreen pass (not composited) for the "
+             "same slot as 'shader[n].frag'. Add '#pragma hdr' to any pass for "
+             "a float FBO that holds values outside [0,1].\n"
+             "Picture channels: place 'img[n]_[c].png' (c 0-3) next to the "
+             "shader to bind them to 'u_texture[c]' in layer n.\n"
              "\nCreated by Genevra Rose\n");
       return 0;
     }
@@ -704,10 +784,17 @@ int main(int argc, char *argv[]) {
 
   int shader_num = 0;
   while (true) {
-    std::string shader_filename =
-        "shader" + std::to_string(shader_num) + ".frag";
+    // shaderN.frag composites to screen; bufferN.frag is an offscreen buffer.
+    std::string base = "shader" + std::to_string(shader_num);
+    bool is_display = true;
     std::string shader_code =
-        load_shader_from_file(get_config_file(shader_filename));
+        load_shader_from_file(get_config_file(base + ".frag"));
+
+    if (shader_code.empty()) {
+      base = "buffer" + std::to_string(shader_num);
+      shader_code = load_shader_from_file(get_config_file(base + ".frag"));
+      is_display = false;
+    }
 
     if (shader_code.empty()) {
       // Will be num of loaded because ++ last run
@@ -715,23 +802,22 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    logDebug("Found %s", shader_filename.c_str());
+    logDebug("Found %s.frag", base.c_str());
 
     // Check for corresponding vertex shader
-    std::string vert_filename = "shader" + std::to_string(shader_num) + ".vert";
-    std::string vert_code =
-        load_shader_from_file(get_config_file(vert_filename));
+    std::string vert_code = load_shader_from_file(get_config_file(base + ".vert"));
 
     if (vert_code.empty()) {
-      logDebug("No %s found - using default vertex shader",
-               vert_filename.c_str());
+      logDebug("No %s.vert found - using default vertex shader", base.c_str());
       vert_code = default_vert;
     } else {
-      logDebug("Found %s", vert_filename.c_str());
+      logDebug("Found %s.vert", base.c_str());
     }
 
     ShaderLayer layer {};
     layer.enabled = true;
+    layer.display = is_display;
+    layer.hdr = shader_code.find("#pragma hdr") != std::string::npos;
     layer.num = shader_num;
     layer.prog = create_program(shader_code.c_str(), vert_code.c_str());
     layer.u_resolution = glGetUniformLocation(layer.prog, "u_resolution");
@@ -749,6 +835,23 @@ int main(int argc, char *argv[]) {
     layer.texture[0] = 0;
     layer.texture[1] = 0;
     layer.current_buffer = 0;
+
+    // Image channels: imgN_C.<ext> next to the frag binds to u_textureC.
+    layer.image_count = 0;
+    for (int c = 0; c < max_image_channels; c++) {
+      char tname[12];
+      snprintf(tname, sizeof(tname), "u_texture%d", c);
+      layer.u_texture[c] = glGetUniformLocation(layer.prog, tname);
+      if (layer.u_texture[c] == -1) // no sampler, so skip the image I/O entirely
+        continue;
+      GLuint tex = load_layer_image(shader_num, c);
+      if (tex) {
+        layer.image_tex[layer.image_count] = tex;
+        // Channel index for now; init_multipass offsets it by the unit base.
+        layer.image_unit[layer.image_count] = c;
+        layer.image_count++;
+      }
+    }
 
     // Multipass enabling
     for (int i = 0; i <= shader_num; ++i) {
